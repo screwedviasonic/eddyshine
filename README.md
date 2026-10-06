@@ -4,7 +4,25 @@ Eddyshine is Apollo with window capture. When Rig writes `%ProgramData%\Rig\capt
 
 Upstream is [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo) at `adc5c5a0bd80831ce495434bb16aee2cd4175fb8`. The file contract is the same one Rig documents in `docs/eddyshine-integration.md` of the Rig repo.
 
-Build on the gaming PC with MSYS2 UCRT64, the same way as Apollo (`docs/building.md`, Windows section). `cppwinrt` is required. Run the host in the interactive session of the Windows user who is logged into Steam. Windows.Graphics.Capture does not work from LocalSystem. Leave SudoVDA installed. Keep Parsec off the display the game is placed on. Moonlight stays the client. Pair it with this host once, on ports 47984–47990.
+## Download a Windows build
+
+The first test does not need a local MSYS2 toolchain. The [Windows workflow](https://github.com/screwedviasonic/eddyshine/actions/workflows/windows.yml) builds on `windows-latest` with MSYS2 UCRT64, the same compiler Apollo's Windows instructions use, and uploads the cpack ZIP.
+
+1. Open [Actions → Windows](https://github.com/screwedviasonic/eddyshine/actions/workflows/windows.yml).
+2. Open the newest successful run on `main` (a pull request run works too).
+3. Download the **eddyshine-windows** artifact at the bottom of the run summary. GitHub requires a signed-in account to download artifacts.
+4. Unzip the artifact. Inside is `Apollo.zip` (the cpack portable package; the CMake project name is still Apollo) and `SHA256SUMS`.
+5. Unzip `Apollo.zip` on the gaming PC. Quit stock Apollo so both hosts do not bind ports 47984–47990. Start `sunshine.exe` from that folder in the interactive session of the Windows user who is logged into Steam. Windows.Graphics.Capture does not work from LocalSystem. Leave SudoVDA installed. Keep Parsec off the display the game is placed on. Moonlight stays the client.
+
+From a machine with the GitHub CLI, after `gh auth login`:
+
+```bash
+gh run download --repo screwedviasonic/eddyshine --name eddyshine-windows
+```
+
+## Build locally
+
+Build on the gaming PC with MSYS2 UCRT64, the same way as Apollo (`docs/building.md`, Windows section). `cppwinrt` is required.
 
 ```bash
 pacman -S git mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-cppwinrt mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-boost mingw-w64-ucrt-x86_64-curl-winssl mingw-w64-ucrt-x86_64-MinHook mingw-w64-ucrt-x86_64-miniupnpc mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-nlohmann_json mingw-w64-ucrt-x86_64-onevpl
