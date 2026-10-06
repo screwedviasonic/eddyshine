@@ -1,0 +1,102 @@
+# Adapted from LizardByte/Sunshine .github/workflows/ci-windows.yml.
+# Apollo does not ship a workflow. This job keeps the UCRT64 CMake/Ninja/cpack
+# path Sunshine uses for Windows-AMD64 and uploads only the portable ZIP.
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: UCRT64
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Node.js path
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          $dir = Split-Path -Path $node -Parent
+          echo "NODEJS_PATH=$dir" >> $env:GITHUB_ENV
+
+      - name: Configure and build
+        shell: msys2 {0}
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BUILD_VERSION: 0.1.0
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
+          export PATH="$PATH:$NODEJS_PATH"
+          node -v
+          npm -v
+          cmake \
+            -B build \
+            -G Ninja \
+            -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_TESTS=OFF \
+            -DSUNSHINE_ASSETS_DIR=assets
+          echo "::add-matcher::.github/matchers/gcc.json"
+          ninja -C build
+          echo "::remove-matcher owner=gcc::"
+
+      - name: Package ZIP
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cpack -G ZIP --config ./build/CPackConfig.cmake
+          cd build/cpack_artifacts
+          ls -la
+          sha256sum ./*.zip | tee SHA256SUMS
+
+      - name: Upload cpack ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: eddyshine-windows
+          path: |
+            build/cpack_artifacts/*.zip
+            build/cpack_artifacts/SHA256SUMS
+          if-no-files-found: error
