@@ -1,3 +1,20 @@
+# Eddyshine
+
+Eddyshine is Apollo with window capture. When Rig writes `%ProgramData%\Rig\capture.txt` with `capture=window` and a decimal `hwnd`, this build calls `Windows.Graphics.Capture` `CreateForWindow` and encodes that window. Stock Apollo only calls `CreateForMonitor` (or DXGI desktop duplication). A failed window bind logs `capture=display-fallback` and encodes the monitor. That line is a failure, not a silent success.
+
+Upstream is [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo) at `adc5c5a0bd80831ce495434bb16aee2cd4175fb8`. The file contract is the same one Rig documents in `docs/eddyshine-integration.md` of the Rig repo.
+
+Build on the gaming PC with MSYS2 UCRT64, the same way as Apollo (`docs/building.md`, Windows section). `cppwinrt` is required. Run the host in the interactive session of the Windows user who is logged into Steam. Windows.Graphics.Capture does not work from LocalSystem. Leave SudoVDA installed. Keep Parsec off the display the game is placed on. Moonlight stays the client. Pair it with this host once, on ports 47984–47990.
+
+```bash
+pacman -S git mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-cppwinrt mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-boost mingw-w64-ucrt-x86_64-curl-winssl mingw-w64-ucrt-x86_64-MinHook mingw-w64-ucrt-x86_64-miniupnpc mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-nlohmann_json mingw-w64-ucrt-x86_64-onevpl
+cmake -B build -G Ninja -S .
+ninja -C build
+cpack -G ZIP --config ./build/CPackConfig.cmake
+```
+
+Install Node.js from nodejs.org and put it on `PATH` before cmake. Do not use MSYS2's node package. Quit stock Apollo before starting this build, or both will bind the same ports.
+
 # Apollo
 
 Apollo is a self-hosted desktop stream host for [Artemis(Moonlight Noir)](https://github.com/ClassicOldSong/moonlight-android). Offering low latency, native client resolution, cloud gaming server capabilities with support for AMD, Intel, and Nvidia GPUs for hardware encoding. Software encoding is also available. A web UI is provided to allow configuration and client pairing from your favorite web browser. Pair from the local server or any mobile device.

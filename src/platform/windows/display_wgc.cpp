@@ -16,7 +16,14 @@
 // local includes
 #include "display.h"
 #include "misc.h"
+#include "rig_target.h"
 #include "src/logging.h"
+
+#include <chrono>
+#include <cstdint>
+#include <sstream>
+#include <string>
+#include <thread>
 
 namespace platf {
   using namespace std::literals;
@@ -108,10 +115,74 @@ namespace platf::dxgi {
     display->output->GetDesc(&output_desc);
 
     auto monitor_factory = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-    if (monitor_factory == nullptr ||
-        FAILED(status = monitor_factory->CreateForMonitor(output_desc.Monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
-      BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to acquire display: [0x"sv << util::hex(status).to_string_view() << ']';
+    if (monitor_factory == nullptr) {
+      BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: no capture factory"sv;
       return -1;
+    }
+
+    rig::target_t rig_target = rig::read_target();
+    if (rig_target.window) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+      bool logged_wait = false;
+      while (rig_target.hwnd == 0 || !IsWindow(reinterpret_cast<HWND>(static_cast<uintptr_t>(rig_target.hwnd)))) {
+        if (!logged_wait) {
+          rig::write_status("window-waiting", rig_target.hwnd, rig_target.generation, "waiting for the game window");
+          BOOST_LOG(info) << "capture=window-waiting"sv;
+          logged_wait = true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        rig_target = rig::read_target();
+        if (!rig_target.window) {
+          break;
+        }
+      }
+    }
+
+    bool used_window = false;
+    std::string fallback_reason;
+    if (rig_target.window && rig_target.hwnd != 0) {
+      HWND game = reinterpret_cast<HWND>(static_cast<uintptr_t>(rig_target.hwnd));
+      if (!IsWindow(game)) {
+        fallback_reason = "hwnd is not a window";
+      } else if (FAILED(status = monitor_factory->CreateForWindow(game, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
+        std::ostringstream hex;
+        hex << "CreateForWindow failed 0x" << std::hex << std::uppercase << static_cast<std::uint32_t>(status);
+        fallback_reason = hex.str();
+      } else {
+        used_window = true;
+        bound_hwnd = rig_target.hwnd;
+        bound_generation = rig_target.generation;
+        bound_to_window = true;
+        const auto size = item.Size();
+        if (size.Width > 0 && size.Height > 0) {
+          display->width = size.Width;
+          display->height = size.Height;
+        }
+        rig::write_status("window", rig_target.hwnd, rig_target.generation, "");
+        BOOST_LOG(info) << "capture=window hwnd="sv << rig_target.hwnd
+                        << " pid="sv << rig_target.pid
+                        << " generation="sv << rig_target.generation
+                        << " size="sv << display->width << 'x' << display->height;
+      }
+    } else if (rig_target.window) {
+      fallback_reason = "timed out waiting for a game hwnd";
+    }
+
+    if (!used_window) {
+      bound_to_window = false;
+      bound_hwnd = rig_target.hwnd;
+      bound_generation = rig_target.generation;
+      if (rig_target.window) {
+        rig::write_status("display-fallback", 0, rig_target.generation, fallback_reason);
+        BOOST_LOG(warning) << "capture=display-fallback reason="sv << fallback_reason;
+      }
+      if (FAILED(status = monitor_factory->CreateForMonitor(output_desc.Monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
+        BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to acquire display: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
     }
 
     if (config.dynamicRange) {
@@ -191,6 +262,19 @@ namespace platf::dxgi {
    */
   capture_e wgc_capture_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) {
     // this CONSUMER runs in the capture thread
+    const rig::target_t rig_target = rig::read_target();
+    if (bound_to_window) {
+      const HWND game = reinterpret_cast<HWND>(static_cast<uintptr_t>(bound_hwnd));
+      if (!rig_target.window || rig_target.hwnd != bound_hwnd || rig_target.generation != bound_generation || !IsWindow(game)) {
+        if (rig_target.window && rig_target.hwnd != 0 && rig_target.hwnd != bound_hwnd) {
+          BOOST_LOG(info) << "capture=window rebind hwnd="sv << rig_target.hwnd << " generation="sv << rig_target.generation;
+        }
+        return capture_e::reinit;
+      }
+    } else if (rig_target.window && rig_target.hwnd != 0 && rig_target.generation != bound_generation) {
+      BOOST_LOG(info) << "capture=window retry hwnd="sv << rig_target.hwnd << " generation="sv << rig_target.generation;
+      return capture_e::reinit;
+    }
     release_frame();
 
     AcquireSRWLockExclusive(&frame_lock);

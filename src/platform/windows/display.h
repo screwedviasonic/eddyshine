@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include <cstdint>
+
 // platform includes
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -348,6 +350,10 @@ namespace platf::dxgi {
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame produced_frame {nullptr}, consumed_frame {nullptr};
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
+    // HWND Rig published, as a decimal uintptr. 0 when this session is bound to a monitor.
+    std::uint64_t bound_hwnd = 0;
+    std::uint64_t bound_generation = 0;
+    bool bound_to_window = false;
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
 
