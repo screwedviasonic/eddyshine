@@ -25,6 +25,7 @@ extern "C" {
 #include "display_device.h"
 #include "globals.h"
 #include "input.h"
+#include "live_resize.h"
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
@@ -53,6 +54,8 @@ extern "C" {
 #define IDX_SET_CLIPBOARD 16
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 17
 #define IDX_SET_ADAPTIVE_TRIGGERS 18
+#define IDX_DYNAMIC_PARAM_CHANGE 19
+#define IDX_RESOLUTION_CHANGE 20
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -74,6 +77,8 @@ static const short packetTypes[] = {
   0x3001,  // Set Clipboard (Apollo protocol extension)
   0x3002,  // File transfer nonce request (Apollo protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5506,  // Dynamic parameter change (Foundation Sunshine extension)
+  0x5507,  // Resolution change notification (Foundation Sunshine extension)
 };
 
 namespace asio = boost::asio;
@@ -217,6 +222,13 @@ namespace stream {
 
     // Sunshine protocol extension
     SS_HDR_METADATA metadata;
+  };
+
+  struct control_resolution_change_t {
+    control_header_v2 header;
+
+    std::uint32_t width;
+    std::uint32_t height;
   };
 
   typedef struct control_encrypted_t {
@@ -374,6 +386,7 @@ namespace stream {
 
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
+      safe::mail_raw_t::event_t<live_resize::request_t> resize_requests;
 
       std::unique_ptr<platf::deinit_t> qos;
     } video;
@@ -409,7 +422,17 @@ namespace stream {
 
       platf::feedback_queue_t feedback_queue;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
+      safe::mail_raw_t::event_t<live_resize::notify_t> resolution_notify;
     } control;
+
+    // Set once this client sends 0x5506. Stock Moonlight never does, so it
+    // never receives 0x5507 (that notification freezes clients which ignore it).
+    bool accepts_resolution_change {false};
+    live_resize::debouncer_t resize_debounce;
+    // Encode size published by the video thread. The control thread reads these
+    // instead of config.monitor, which that thread also writes.
+    std::atomic<int> published_encode_width {0};
+    std::atomic<int> published_encode_height {0};
 
     std::uint32_t launch_session_id;
     std::string device_name;
@@ -927,6 +950,85 @@ namespace stream {
     return 0;
   }
 
+  int send_resolution_change(session_t *session, std::uint32_t width, std::uint32_t height) {
+    if (!session->control.peer) {
+      BOOST_LOG(warning) << "Couldn't send resolution change, still waiting for PING from Moonlight"sv;
+      return -1;
+    }
+    if (!session->accepts_resolution_change) {
+      return 0;
+    }
+
+    control_resolution_change_t plaintext {};
+    plaintext.header.type = packetTypes[IDX_RESOLUTION_CHANGE];
+    plaintext.header.payloadLength = sizeof(control_resolution_change_t) - sizeof(control_header_v2);
+    plaintext.width = util::endian::little(width);
+    plaintext.height = util::endian::little(height);
+
+    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Couldn't send resolution change to ["sv << addr << ':' << port << ']';
+      return -1;
+    }
+
+    BOOST_LOG(info) << "Sent resolution change "sv << width << 'x' << height;
+    return 0;
+  }
+
+  void apply_client_resize(session_t *session, int requested_w, int requested_h, int clamped_w, int clamped_h, live_resize::resize_source_e source) {
+    session->accepts_resolution_change = true;
+    if (source == live_resize::resize_source_e::resize_file) {
+      BOOST_LOG(warning) << "live-resize source=resize.txt opts this session into 0x5507; a stock Moonlight client can freeze"sv;
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    live_resize::clear_observed_frame_size();
+    const auto outcome = live_resize::resize_captured_window(clamped_w, clamped_h);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    const int encode_w = session->published_encode_width.load(std::memory_order_acquire);
+    const int encode_h = session->published_encode_height.load(std::memory_order_acquire);
+    if (!outcome.attempted || !outcome.followed) {
+      BOOST_LOG(info) << "live-resize source="sv << live_resize::source_name(source)
+                      << " requested="sv << requested_w << 'x' << requested_h
+                      << " applied_window="sv << outcome.applied_width << 'x' << outcome.applied_height
+                      << " encode="sv << encode_w << 'x' << encode_h
+                      << " letterbox=1 elapsed_ms="sv << elapsed
+                      << " reason="sv << outcome.reason;
+      return;
+    }
+
+    if (clamped_w == encode_w && clamped_h == encode_h) {
+      BOOST_LOG(info) << "live-resize source="sv << live_resize::source_name(source)
+                      << " requested="sv << requested_w << 'x' << requested_h
+                      << " applied_window="sv << outcome.applied_width << 'x' << outcome.applied_height
+                      << " encode="sv << encode_w << 'x' << encode_h
+                      << " elapsed_ms="sv << elapsed
+                      << " reason=already-encoding"sv;
+      return;
+    }
+
+    live_resize::request_capture_reinit();
+    live_resize::request_t request;
+    request.requested_width = requested_w;
+    request.requested_height = requested_h;
+    request.clamped_width = clamped_w;
+    request.clamped_height = clamped_h;
+    request.applied_width = outcome.applied_width;
+    request.applied_height = outcome.applied_height;
+    request.window_followed = true;
+    request.source = source;
+    request.requested_at = started;
+    session->video.resize_requests->raise(std::move(request));
+    BOOST_LOG(info) << "live-resize source="sv << live_resize::source_name(source)
+                    << " requested="sv << requested_w << 'x' << requested_h
+                    << " applied_window="sv << outcome.applied_width << 'x' << outcome.applied_height
+                    << " waiting for capture"sv;
+  }
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -960,6 +1062,36 @@ namespace stream {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
       session->video.idr_events->raise(true);
+    });
+
+    // Foundation Sunshine dynamic parameter change. Only RESOLUTION (type 0) is applied.
+    // Other param types are ignored so a Foundation client cannot change bitrate here.
+    server->map(packetTypes[IDX_DYNAMIC_PARAM_CHANGE], [](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(debug) << "type [IDX_DYNAMIC_PARAM_CHANGE]"sv;
+      const auto parsed = live_resize::parse_resolution_payload(payload);
+      if (!parsed) {
+        BOOST_LOG(debug) << "Ignoring dynamic param that is not a resolution request ("sv << payload.size() << " bytes)"sv;
+        return;
+      }
+      session->accepts_resolution_change = true;
+      const auto clamped = live_resize::clamp_encode_size(parsed->width, parsed->height, session->config.monitor.videoFormat);
+      if (!clamped) {
+        BOOST_LOG(warning) << "live-resize rejected requested="sv << parsed->width << 'x' << parsed->height;
+        return;
+      }
+      live_resize::size_request_t size;
+      size.requested_width = parsed->width;
+      size.requested_height = parsed->height;
+      size.width = clamped->width;
+      size.height = clamped->height;
+      const auto decision = session->resize_debounce.push(size, std::chrono::steady_clock::now());
+      if (decision == live_resize::push_result_e::apply) {
+        apply_client_resize(session, size.requested_width, size.requested_height, size.width, size.height, live_resize::resize_source_e::control);
+      } else if (decision == live_resize::push_result_e::hold) {
+        BOOST_LOG(debug) << "live-resize debounce holding "sv << size.width << 'x' << size.height;
+      } else {
+        BOOST_LOG(debug) << "live-resize debounce dropped "sv << size.width << 'x' << size.height;
+      }
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
@@ -1182,6 +1314,26 @@ namespace stream {
               auto hdr_info = hdr_queue->pop();
 
               send_hdr_mode(session, std::move(hdr_info));
+            }
+
+            if (session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
+              if (auto file_resize = live_resize::take_resize_file()) {
+                const auto clamped = live_resize::clamp_encode_size(file_resize->width, file_resize->height, session->config.monitor.videoFormat);
+                if (!clamped) {
+                  BOOST_LOG(warning) << "live-resize source=resize.txt rejected requested="sv << file_resize->width << 'x' << file_resize->height;
+                } else {
+                  apply_client_resize(session, file_resize->width, file_resize->height, clamped->width, clamped->height, live_resize::resize_source_e::resize_file);
+                }
+              }
+              if (auto held = session->resize_debounce.poll(now)) {
+                apply_client_resize(session, held->requested_width, held->requested_height, held->width, held->height, live_resize::resize_source_e::control);
+              }
+            }
+
+            auto &resolution_notify = session->control.resolution_notify;
+            while (session->control.peer && resolution_notify->peek()) {
+              auto notify = resolution_notify->pop();
+              send_resolution_change(session, static_cast<std::uint32_t>(notify->width), static_cast<std::uint32_t>(notify->height));
             }
           }
 
@@ -2145,6 +2297,18 @@ namespace stream {
       return 0;
     }
 
+    void note_encode_size(void *session_p, int width, int height, int bitrate_kbps) {
+      if (!session_p) {
+        return;
+      }
+      auto session = static_cast<session_t *>(session_p);
+      session->published_encode_width.store(width, std::memory_order_release);
+      session->published_encode_height.store(height, std::memory_order_release);
+      session->config.monitor.width = width;
+      session->config.monitor.height = height;
+      session->config.monitor.bitrate = bitrate_kbps;
+    }
+
     std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session) {
       auto session = std::make_shared<session_t>();
 
@@ -2160,10 +2324,14 @@ namespace stream {
       session->undo_cmds = std::move(launch_session.client_undo_cmds);
 
       session->config = config;
+      session->published_encode_width.store(config.monitor.width, std::memory_order_release);
+      session->published_encode_height.store(config.monitor.height, std::memory_order_release);
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
       session->control.hdr_queue = mail->event<video::hdr_info_t>(mail::hdr);
+      session->control.resolution_notify = mail->event<live_resize::notify_t>(mail::resolution_notify);
+      session->video.resize_requests = mail->event<live_resize::request_t>(mail::resize_request);
       session->control.legacy_input_enc_iv = launch_session.iv;
       session->control.cipher = crypto::cipher::gcm_t {
         launch_session.gcm_key,

@@ -79,6 +79,11 @@ namespace nvhttp {
    */
   void setup(const std::string &pkey, const std::string &cert);
 
+  /**
+   * @brief Advertise live client resize (0x5506) in a /serverinfo tree.
+   */
+  void advertise_live_resize(boost::property_tree::ptree &tree);
+
   class SunshineHTTPS: public SimpleWeb::HTTPS {
   public:
     SunshineHTTPS(boost::asio::io_context &io_context, boost::asio::ssl::context &ctx):

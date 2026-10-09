@@ -540,6 +540,9 @@ namespace platf {
 
     int width, height;
 
+    // True when this display is bound to a single HWND (WGC CreateForWindow).
+    bool window_capture {false};
+
   protected:
     // collect capture timing data (at loglevel debug)
     logging::time_delta_periodic_logger sleep_overshoot_logger = {debug, "Frame capture sleep overshoot"};

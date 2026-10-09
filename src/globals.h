@@ -53,6 +53,8 @@ namespace mail {
   MAIL(touch_port);
   MAIL(idr);
   MAIL(invalidate_ref_frames);
+  MAIL(resize_request);
+  MAIL(resolution_notify);
   MAIL(gamepad_feedback);
   MAIL(hdr);
 #undef MAIL

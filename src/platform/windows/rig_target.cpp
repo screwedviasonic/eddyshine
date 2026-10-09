@@ -8,11 +8,14 @@
 
 #include "rig_target.h"
 
+#include "src/live_resize.h"
+
 #include <Windows.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -95,6 +98,24 @@ namespace rig {
   bool window_requested() {
     const target_t target = read_target();
     return target.present && target.window;
+  }
+
+  std::optional<resize_file_t> consume_resize_file() {
+    const auto path = rig_dir() / "resize.txt";
+    std::ifstream in(path);
+    if (!in) {
+      return std::nullopt;
+    }
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    in.close();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    const auto parsed = live_resize::parse_resize_file(buffer.str());
+    if (!parsed) {
+      return std::nullopt;
+    }
+    return resize_file_t {parsed->width, parsed->height};
   }
 
   void write_status(const char *capture, std::uint64_t hwnd, std::uint64_t generation, const std::string &reason) {

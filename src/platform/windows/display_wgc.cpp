@@ -17,6 +17,7 @@
 #include "display.h"
 #include "misc.h"
 #include "rig_target.h"
+#include "src/live_resize.h"
 #include "src/logging.h"
 
 #include <chrono>
@@ -156,10 +157,25 @@ namespace platf::dxgi {
         bound_hwnd = rig_target.hwnd;
         bound_generation = rig_target.generation;
         bound_to_window = true;
+        display->window_capture = true;
+        // WGC returns the window upright. Do not apply the monitor's DXGI rotation.
+        display->display_rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
         const auto size = item.Size();
-        if (size.Width > 0 && size.Height > 0) {
-          display->width = size.Width;
-          display->height = size.Height;
+        int frame_w = size.Width;
+        int frame_h = size.Height;
+        int observed_w = 0;
+        int observed_h = 0;
+        if (live_resize::observed_frame_size(observed_w, observed_h)) {
+          frame_w = observed_w;
+          frame_h = observed_h;
+          // One shot. A later rebind must use the new item's size.
+          live_resize::clear_observed_frame_size();
+        }
+        if (frame_w > 0 && frame_h > 0) {
+          display->width = frame_w;
+          display->height = frame_h;
+          display->width_before_rotation = frame_w;
+          display->height_before_rotation = frame_h;
         }
         rig::write_status("window", rig_target.hwnd, rig_target.generation, "");
         BOOST_LOG(info) << "capture=window hwnd="sv << rig_target.hwnd
@@ -192,7 +208,15 @@ namespace platf::dxgi {
     }
 
     try {
-      frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(uwp_device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(display->capture_format), 2, item.Size());
+      const auto pixel_format = static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(display->capture_format);
+      pool_format = static_cast<std::uint32_t>(pixel_format);
+      winrt::Windows::Graphics::SizeInt32 pool_size {display->width, display->height};
+      if (pool_size.Width <= 0 || pool_size.Height <= 0) {
+        pool_size = item.Size();
+      }
+      pool_width = pool_size.Width;
+      pool_height = pool_size.Height;
+      frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(uwp_device, pixel_format, 2, pool_size);
       capture_session = frame_pool.CreateCaptureSession(item);
       frame_pool.FrameArrived({this, &wgc_capture_t::on_frame_arrived});
     } catch (winrt::hresult_error &e) {
@@ -242,6 +266,24 @@ namespace platf::dxgi {
       return;
     }
     if (frame != nullptr) {
+      const auto content = frame.ContentSize();
+      if (content.Width > 0 && content.Height > 0 && (content.Width != pool_width || content.Height != pool_height)) {
+        BOOST_LOG(info) << "capture=window content-size "sv << pool_width << 'x' << pool_height
+                        << " -> "sv << content.Width << 'x' << content.Height;
+        frame.Close();
+        try {
+          const auto format = static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(pool_format);
+          sender.Recreate(uwp_device, format, 2, content);
+          pool_width = content.Width;
+          pool_height = content.Height;
+          live_resize::note_observed_frame_size(content.Width, content.Height);
+          content_resized.store(true);
+        } catch (winrt::hresult_error &e) {
+          BOOST_LOG(error) << "Failed to recreate capture frame pool: [0x"sv << util::hex(e.code()).to_string_view() << ']';
+        }
+        WakeConditionVariable(&frame_present_cv);
+        return;
+      }
       AcquireSRWLockExclusive(&frame_lock);
       if (produced_frame) {
         produced_frame.Close();
@@ -262,6 +304,10 @@ namespace platf::dxgi {
    */
   capture_e wgc_capture_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) {
     // this CONSUMER runs in the capture thread
+    if (content_resized.exchange(false) || live_resize::consume_capture_reinit()) {
+      release_frame();
+      return capture_e::reinit;
+    }
     const rig::target_t rig_target = rig::read_target();
     if (bound_to_window) {
       const HWND game = reinterpret_cast<HWND>(static_cast<uintptr_t>(bound_hwnd));
