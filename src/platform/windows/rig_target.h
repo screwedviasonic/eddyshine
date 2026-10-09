@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace rig {
@@ -23,7 +24,14 @@ namespace rig {
     std::uint64_t generation = 0;
   };
 
+  struct resize_file_t {
+    int width = 0;
+    int height = 0;
+  };
+
   target_t read_target();
   bool window_requested();
+  // Read `%ProgramData%\Rig\resize.txt` once and delete it.
+  std::optional<resize_file_t> consume_resize_file();
   void write_status(const char *capture, std::uint64_t hwnd, std::uint64_t generation, const std::string &reason);
 }  // namespace rig

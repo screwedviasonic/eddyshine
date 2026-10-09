@@ -33,6 +33,10 @@ cpack -G ZIP --config ./build/CPackConfig.cmake
 
 Install Node.js from nodejs.org and put it on `PATH` before cmake. Do not use MSYS2's node package. Quit stock Apollo before starting this build, or both will bind the same ports.
 
+## Live resize
+
+A client can change the stream size without restarting the session. `/serverinfo` advertises `<ClientResolutionChange>1</ClientResolutionChange>`. The `0x5506` / `0x5507` layout, the `resize.txt` harness, and why stock Moonlight must not be sent `0x5507` are in [docs/live-resize.md](docs/live-resize.md).
+
 # Apollo
 
 Apollo is a self-hosted desktop stream host for [Artemis(Moonlight Noir)](https://github.com/ClassicOldSong/moonlight-android). Offering low latency, native client resolution, cloud gaming server capabilities with support for AMD, Intel, and Nvidia GPUs for hardware encoding. Software encoding is also available. A web UI is provided to allow configuration and client pairing from your favorite web browser. Pair from the local server or any mobile device.

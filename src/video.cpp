@@ -25,9 +25,11 @@ extern "C" {
 #include "display_device.h"
 #include "globals.h"
 #include "input.h"
+#include "live_resize.h"
 #include "logging.h"
 #include "nvenc/nvenc_base.h"
 #include "platform/common.h"
+#include "stream.h"
 #include "sync.h"
 #include "video.h"
 
@@ -2388,6 +2390,15 @@ namespace video {
 
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
+    auto resize_event = mail->event<live_resize::request_t>(mail::resize_request);
+    auto resolution_event = mail->event<live_resize::notify_t>(mail::resolution_notify);
+    auto idr_event = mail->event<bool>(mail::idr);
+
+    const int baseline_width = config.width;
+    const int baseline_height = config.height;
+    const int baseline_bitrate = config.bitrate;
+    live_resize::request_t pending {};
+    bool have_pending = false;
 
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
@@ -2407,6 +2418,72 @@ namespace video {
         }
 
         display = ref->display_wp->lock();
+      }
+      if (!display) {
+        continue;
+      }
+
+      while (resize_event->peek()) {
+        auto next = resize_event->pop(0s);
+        if (!next) {
+          break;
+        }
+        pending = std::move(*next);
+        have_pending = true;
+      }
+
+      if (have_pending) {
+        const auto decision = live_resize::decide_resize(
+          display->width,
+          display->height,
+          pending.clamped_width,
+          pending.clamped_height,
+          pending.window_followed,
+          display->window_capture,
+          pending.requested_at,
+          std::chrono::steady_clock::now(),
+          config.width,
+          config.height,
+          baseline_bitrate,
+          baseline_width,
+          baseline_height
+        );
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - pending.requested_at).count();
+        if (decision.action == live_resize::adopt_e::wait) {
+          std::this_thread::sleep_for(20ms);
+          continue;
+        }
+        if (decision.action == live_resize::adopt_e::adopt) {
+          config.width = decision.width;
+          config.height = decision.height;
+          config.bitrate = decision.bitrate_kbps;
+          stream::session::note_encode_size(channel_data, config.width, config.height, config.bitrate);
+          BOOST_LOG(info) << "live-resize source="sv << live_resize::source_name(pending.source)
+                          << " requested="sv << pending.requested_width << 'x' << pending.requested_height
+                          << " applied_window="sv << pending.applied_width << 'x' << pending.applied_height
+                          << " encode="sv << config.width << 'x' << config.height
+                          << " bitrate_kbps="sv << config.bitrate
+                          << " elapsed_ms="sv << elapsed;
+          resolution_event->raise(live_resize::notify_t {config.width, config.height});
+          // 0x5507 has to leave before the IDR. Encoder setup below adds more delay.
+          std::this_thread::sleep_for(live_resize::notify_lead);
+          idr_event->raise(true);
+        } else if (decision.action == live_resize::adopt_e::letterbox) {
+          BOOST_LOG(info) << "live-resize source="sv << live_resize::source_name(pending.source)
+                          << " requested="sv << pending.requested_width << 'x' << pending.requested_height
+                          << " applied_window="sv << pending.applied_width << 'x' << pending.applied_height
+                          << " encode="sv << config.width << 'x' << config.height
+                          << " letterbox=1 elapsed_ms="sv << elapsed
+                          << " reason=capture-did-not-follow"sv;
+        } else {
+          BOOST_LOG(info) << "live-resize source="sv << live_resize::source_name(pending.source)
+                          << " requested="sv << pending.requested_width << 'x' << pending.requested_height
+                          << " applied_window="sv << pending.applied_width << 'x' << pending.applied_height
+                          << " encode="sv << config.width << 'x' << config.height
+                          << " elapsed_ms="sv << elapsed
+                          << " reason=unchanged"sv;
+        }
+        have_pending = false;
       }
 
       auto &encoder = *chosen_encoder;

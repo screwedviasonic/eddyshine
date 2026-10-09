@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 // platform includes
@@ -354,6 +355,11 @@ namespace platf::dxgi {
     std::uint64_t bound_hwnd = 0;
     std::uint64_t bound_generation = 0;
     bool bound_to_window = false;
+    int pool_width = 0;
+    int pool_height = 0;
+    std::uint32_t pool_format = 0;
+    // Set on the frame-pool thread when ContentSize changes. Consumed by next_frame.
+    std::atomic<bool> content_resized {false};
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
 

@@ -55,6 +55,7 @@ namespace stream {
     void graceful_stop(session_t& session);
     void join(session_t &session);
     state_e state(session_t &session);
+    void note_encode_size(void *session, int width, int height, int bitrate_kbps);
     inline bool send(session_t& session, const std::string_view &payload);
   }  // namespace session
 }  // namespace stream

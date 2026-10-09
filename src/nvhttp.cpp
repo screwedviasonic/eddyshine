@@ -27,6 +27,7 @@
 #include "globals.h"
 #include "httpcommon.h"
 #include "logging.h"
+#include "live_resize.h"
 #include "network.h"
 #include "nvhttp.h"
 #include "platform/common.h"
@@ -879,6 +880,10 @@ namespace nvhttp {
     return true;
   }
 
+  void advertise_live_resize(pt::ptree &tree) {
+    tree.put("root."s + std::string {live_resize::capability_name}, live_resize::client_resolution_change_capability());
+  }
+
   template<class T>
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
@@ -987,6 +992,7 @@ namespace nvhttp {
       }
     }
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
+    advertise_live_resize(tree);
 
     tree.put("root.PairStatus", pair_status);
 
