@@ -6,6 +6,8 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <chrono>
 #include <list>
@@ -125,7 +127,22 @@ namespace nvhttp {
      * @brief used as a security measure to prevent out of order calls
      */
     PAIR_PHASE last_phase = PAIR_PHASE::NONE;
+
+    // Set when the async pairing response is stored. pin() prefers the newest.
+    std::uint64_t ready_seq = 0;
   };
+
+  inline bool pair_session_has_response(const pair_session_t &sess) {
+    const auto &response = sess.async_insert_pin.response;
+    const bool http = response.has_left() && static_cast<bool>(response.left());
+    const bool https = response.has_right() && static_cast<bool>(response.right());
+    return http || https;
+  }
+
+  // True only when Moonlight's getservercert response is parked and no phase has started.
+  inline bool pair_session_accepts_pin(const pair_session_t &sess) {
+    return sess.last_phase == PAIR_PHASE::NONE && pair_session_has_response(sess);
+  }
 
   /**
    * @brief removes the temporary pairing session
@@ -188,7 +205,10 @@ namespace nvhttp {
    * @brief Compare the user supplied pin to the Moonlight pin.
    * @param pin The user supplied pin.
    * @param name The user supplied name.
-   * @return `true` if the pin is correct, `false` otherwise.
+   * @return `true` if the pin was applied to a waiting session, `false` otherwise.
+   *
+   * Returns false without changing pairing state when the pin is invalid or no
+   * session has a stored response and is still in PAIR_PHASE::NONE.
    * @examples
    * bool pin_status = nvhttp::pin("1234", "laptop");
    * @examples_end
@@ -282,4 +302,11 @@ namespace nvhttp {
     const bool allow_client_commands,
     const bool always_use_virtual_display
   );
+
+#ifdef SUNSHINE_TESTS
+  void test_reset_pair_sessions();
+  void test_install_pair_session(pair_session_t sess);
+  std::size_t test_pair_session_count();
+  std::optional<PAIR_PHASE> test_pair_phase(const std::string &unique_id);
+#endif
 }  // namespace nvhttp
