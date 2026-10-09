@@ -6,11 +6,14 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <format>
+#include <mutex>
 #include <string>
 #include <utility>
-#include <string>
 
 // lib includes
 #include <boost/asio/ssl/context.hpp>
@@ -146,8 +149,10 @@ namespace nvhttp {
     std::string pkey;
   } conf_intern;
 
-  // uniqueID, session
+  // uniqueID, session. Every access takes map_id_sess_lock.
   std::unordered_map<std::string, pair_session_t> map_id_sess;
+  std::recursive_mutex map_id_sess_lock;
+  std::uint64_t pair_wait_seq = 0;
   client_t client_root;
   std::atomic<uint32_t> session_id_counter;
 
@@ -470,8 +475,62 @@ namespace nvhttp {
     return launch_session;
   }
 
+  using pin_response_t = decltype(pair_session_t {}.async_insert_pin.response);
+
+  bool write_pin_response(pin_response_t response, const std::string &body) {
+    if (response.has_left() && response.left()) {
+      response.left()->write(body);
+      return true;
+    }
+    if (response.has_right() && response.right()) {
+      response.right()->write(body);
+      return true;
+    }
+    return false;
+  }
+
+  void close_pin_response(pin_response_t &response) {
+    if (response.has_left() && response.left()) {
+      response.left()->close_connection_after_response = true;
+    } else if (response.has_right() && response.right()) {
+      response.right()->close_connection_after_response = true;
+    }
+  }
+
+  // Caller holds map_id_sess_lock. Drops one unique id after answering any parked request,
+  // so a retry cannot keep a half-finished phase in the map.
+  void supersede_pair_session(const std::string &unique_id) {
+    auto it = map_id_sess.find(unique_id);
+    if (it == std::end(map_id_sess)) {
+      return;
+    }
+
+    auto response = std::move(it->second.async_insert_pin.response);
+    it->second.async_insert_pin.response = {};
+    map_id_sess.erase(it);
+
+    if (!((response.has_left() && response.left()) || (response.has_right() && response.right()))) {
+      return;
+    }
+
+    pt::ptree tree;
+    tree.put("root.paired", 0);
+    tree.put("root.<xmlattr>.status_code", 400);
+    tree.put("root.<xmlattr>.status_message", "Pairing session replaced");
+    std::ostringstream data;
+    pt::write_xml(data, tree);
+    try {
+      close_pin_response(response);
+      write_pin_response(std::move(response), data.str());
+    } catch (const std::exception &e) {
+      BOOST_LOG(debug) << "Replaced pairing session could not be answered: "sv << e.what();
+    }
+  }
+
   void remove_session(const pair_session_t &sess) {
-    map_id_sess.erase(sess.client.uniqueID);
+    const std::string unique_id = sess.client.uniqueID;
+    std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
+    map_id_sess.erase(unique_id);
   }
 
   void fail_pair(pair_session_t &sess, pt::ptree &tree, const std::string status_msg) {
@@ -636,9 +695,6 @@ namespace nvhttp {
       named_cert_p->allow_client_commands = true;
       named_cert_p->always_use_virtual_display = false;
 
-      auto it = map_id_sess.find(client.uniqueID);
-      map_id_sess.erase(it);
-
       add_authorized_client(named_cert_p);
     } else {
       tree.put("root.paired", 0);
@@ -730,6 +786,7 @@ namespace nvhttp {
     }
 
     auto uniqID {get_arg(args, "uniqueid")};
+    std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
 
     args_t::const_iterator it;
     if (it = args.find("phrase"); it != std::end(args)) {
@@ -747,9 +804,10 @@ namespace nvhttp {
         sess.client.cert = util::from_hex_vec(get_arg(args, "clientcert"), true);
 
         BOOST_LOG(debug) << sess.client.cert;
-        auto ptr = map_id_sess.emplace(sess.client.uniqueID, std::move(sess)).first;
-
-        ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
+        const std::string unique_id = sess.client.uniqueID;
+        sess.async_insert_pin.salt = std::move(get_arg(args, "salt"));
+        supersede_pair_session(unique_id);
+        auto ptr = map_id_sess.emplace(unique_id, std::move(sess)).first;
 
         auto it = args.find("otpauth");
         if (it != std::end(args)) {
@@ -794,6 +852,7 @@ namespace nvhttp {
           system_tray::update_tray_require_pin();
 #endif
           ptr->second.async_insert_pin.response = std::move(response);
+          ptr->second.ready_seq = ++pair_wait_seq;
 
           fg.disable();
           return;
@@ -829,54 +888,48 @@ namespace nvhttp {
   }
 
   bool pin(std::string pin, std::string name) {
-    pt::ptree tree;
-    if (map_id_sess.empty()) {
-      return false;
-    }
-
-    // ensure pin is 4 digits
     if (pin.size() != 4) {
-      tree.put("root.paired", 0);
-      tree.put("root.<xmlattr>.status_code", 400);
-      tree.put(
-        "root.<xmlattr>.status_message",
-        std::format("Pin must be 4 digits, {} provided", pin.size())
-      );
       return false;
     }
-
-    // ensure all pin characters are numeric
     if (!std::all_of(pin.begin(), pin.end(), ::isdigit)) {
-      tree.put("root.paired", 0);
-      tree.put("root.<xmlattr>.status_code", 400);
-      tree.put("root.<xmlattr>.status_message", "Pin must be numeric");
       return false;
     }
 
-    auto &sess = std::begin(map_id_sess)->second;
-    getservercert(sess, tree, pin);
+    pin_response_t response;
+    std::string body;
+    {
+      std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
 
-    if (!name.empty()) {
-      sess.client.name = name;
+      auto chosen = std::end(map_id_sess);
+      for (auto it = std::begin(map_id_sess); it != std::end(map_id_sess); ++it) {
+        if (!pair_session_accepts_pin(it->second)) {
+          continue;
+        }
+        if (chosen == std::end(map_id_sess) || it->second.ready_seq >= chosen->second.ready_seq) {
+          chosen = it;
+        }
+      }
+      if (chosen == std::end(map_id_sess)) {
+        return false;
+      }
+
+      if (!name.empty()) {
+        chosen->second.client.name = name;
+      }
+      // Take the response before getservercert. A failure erases the map node,
+      // and writing through that node would use a dangling session.
+      response = std::move(chosen->second.async_insert_pin.response);
+      chosen->second.async_insert_pin.response = {};
+
+      pt::ptree tree;
+      getservercert(chosen->second, tree, pin);
+
+      std::ostringstream data;
+      pt::write_xml(data, tree);
+      body = std::move(data).str();
     }
 
-    // response to the request for pin
-    std::ostringstream data;
-    pt::write_xml(data, tree);
-
-    auto &async_response = sess.async_insert_pin.response;
-    if (async_response.has_left() && async_response.left()) {
-      async_response.left()->write(data.str());
-    } else if (async_response.has_right() && async_response.right()) {
-      async_response.right()->write(data.str());
-    } else {
-      return false;
-    }
-
-    // reset async_response
-    async_response = std::decay_t<decltype(async_response.left())>();
-    // response to the current request
-    return true;
+    return write_pin_response(std::move(response), body);
   }
 
   template<class T>
@@ -1761,7 +1814,10 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
-    map_id_sess.clear();
+    {
+      std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
+      map_id_sess.clear();
+    }
 
     https_server.stop();
     http_server.stop();
@@ -1884,4 +1940,32 @@ namespace nvhttp {
 
     return removed;
   }
+
+#ifdef SUNSHINE_TESTS
+  void test_reset_pair_sessions() {
+    std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
+    map_id_sess.clear();
+  }
+
+  void test_install_pair_session(pair_session_t sess) {
+    std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
+    const std::string unique_id = sess.client.uniqueID;
+    supersede_pair_session(unique_id);
+    map_id_sess.emplace(unique_id, std::move(sess));
+  }
+
+  std::size_t test_pair_session_count() {
+    std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
+    return map_id_sess.size();
+  }
+
+  std::optional<PAIR_PHASE> test_pair_phase(const std::string &unique_id) {
+    std::lock_guard<std::recursive_mutex> lock(map_id_sess_lock);
+    auto it = map_id_sess.find(unique_id);
+    if (it == std::end(map_id_sess)) {
+      return std::nullopt;
+    }
+    return it->second.last_phase;
+  }
+#endif
 }  // namespace nvhttp

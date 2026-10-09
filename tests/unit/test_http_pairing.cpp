@@ -265,3 +265,62 @@ TEST(PairingTest, OutOfOrderCalls) {
   getservercert(sess, tree, "test");
   ASSERT_FALSE(tree.get<int>("root.paired") == 1);
 }
+
+TEST(PairingPinGuard, PinIgnoresSessionsThatAreNotWaiting) {
+  test_reset_pair_sessions();
+
+  pair_session_t unready;
+  unready.client.uniqueID = "unready";
+  unready.async_insert_pin.salt = "ff5dc6eda99339a8a0793e216c4257c4";
+  unready.last_phase = PAIR_PHASE::NONE;
+  EXPECT_FALSE(pair_session_accepts_pin(unready));
+  test_install_pair_session(std::move(unready));
+
+  pair_session_t started;
+  started.client.uniqueID = "started";
+  started.async_insert_pin.salt = "ff5dc6eda99339a8a0793e216c4257c4";
+  started.last_phase = PAIR_PHASE::GETSERVERCERT;
+  // A response slot that is engaged but empty must not count as waiting.
+  started.async_insert_pin.response.emplace<std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response>>();
+  EXPECT_TRUE(started.async_insert_pin.response.has_left());
+  EXPECT_FALSE(pair_session_accepts_pin(started));
+  test_install_pair_session(std::move(started));
+
+  EXPECT_FALSE(pin("12", "laptop"));
+  EXPECT_FALSE(pin("abcd", "laptop"));
+  EXPECT_FALSE(pin("1234", "laptop"));
+
+  EXPECT_EQ(test_pair_session_count(), 2u);
+  ASSERT_TRUE(test_pair_phase("unready"));
+  EXPECT_EQ(*test_pair_phase("unready"), PAIR_PHASE::NONE);
+  ASSERT_TRUE(test_pair_phase("started"));
+  EXPECT_EQ(*test_pair_phase("started"), PAIR_PHASE::GETSERVERCERT);
+
+  test_reset_pair_sessions();
+}
+
+TEST(PairingPinGuard, NewPairReplacesStaleSession) {
+  test_reset_pair_sessions();
+
+  pair_session_t stale;
+  stale.client.uniqueID = "same-client";
+  stale.last_phase = PAIR_PHASE::GETSERVERCERT;
+  test_install_pair_session(std::move(stale));
+  ASSERT_EQ(*test_pair_phase("same-client"), PAIR_PHASE::GETSERVERCERT);
+
+  pair_session_t fresh;
+  fresh.client.uniqueID = "same-client";
+  fresh.last_phase = PAIR_PHASE::NONE;
+  fresh.async_insert_pin.salt = "ff5dc6eda99339a8a0793e216c4257c4";
+  test_install_pair_session(std::move(fresh));
+
+  EXPECT_EQ(test_pair_session_count(), 1u);
+  ASSERT_TRUE(test_pair_phase("same-client"));
+  EXPECT_EQ(*test_pair_phase("same-client"), PAIR_PHASE::NONE);
+  EXPECT_FALSE(pin("1234", ""));
+  EXPECT_EQ(*test_pair_phase("same-client"), PAIR_PHASE::NONE);
+
+  test_reset_pair_sessions();
+  EXPECT_EQ(test_pair_session_count(), 0u);
+  EXPECT_FALSE(pin("1234", ""));
+}
